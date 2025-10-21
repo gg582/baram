@@ -1,5 +1,5 @@
---- cpufreq_laputil.c.orig	2025-08-25 18:08:44.157067728 +0900
-+++ cpufreq_laputil.c	2025-08-25 18:12:18.085391091 +0900
+--- cpufreq_baram.c.orig	2025-08-25 18:08:44.157067728 +0900
++++ cpufreq_baram.c	2025-08-25 18:12:18.085391091 +0900
 @@ -61,6 +61,7 @@
      struct mutex lock;
      struct cpumask eff_mask;  /* Efficiency cores mask */

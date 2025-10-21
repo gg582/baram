@@ -1,4 +1,4 @@
-obj-m += cpufreq_laputil.o
+obj-m += cpufreq_baram.o
 
 KVERSION = $(shell uname -r)
 

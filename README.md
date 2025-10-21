@@ -1,27 +1,27 @@
-# LapUtil: An Intelligent, Power-Aware CPU Governor for Laptops
+# Baram (formerly LapUtil): An Intelligent, Power-Aware CPU Governor for Laptops
 
 [![DeepSource](https://app.deepsource.com/gh/gg582/laputil.svg/?label=code+coverage&show_trend=true&token=TI2tAytzI2P2dcKbncHMTzfG)](https://app.deepsource.com/gh/gg582/laputil/)  
 [![DeepSource](https://app.deepsource.com/gh/gg582/laputil.svg/?label=active+issues&show_trend=true&token=TI2tAytzI2P2dcKbncHMTzfG)](https://app.deepsource.com/gh/gg582/laputil/)  
 [![DeepSource](https://app.deepsource.com/gh/gg582/laputil.svg/?label=resolved+issues&show_trend=true&token=TI2tAytzI2P2dcKbncHMTzfG)](https://app.deepsource.com/gh/gg582/laputil/)  
 
-**LapUtil** is a custom CPU frequency governor built for laptops, designed to balance **performance and battery life** more intelligently than traditional load-based governors.
-Instead of reacting only to raw CPU utilization, LapUtil runs a **lightweight 1D convolutional neural network (CNN)** entirely inside the kernel. The network ingests a short history of normalized load samples and outputs a signed adjustment that nudges the requested frequency toward what the model predicts the workload will need.
+**Baram** (formerly LapUtil) is a custom CPU frequency governor built for laptops, designed to balance **performance and battery life** more intelligently than traditional load-based governors.
+Instead of reacting only to raw CPU utilization, Baram runs a **lightweight 1D convolutional neural network (CNN)** entirely inside the kernel. The network ingests a short history of normalized load samples and outputs a signed adjustment that nudges the requested frequency toward what the model predicts the workload will need.
 
 ---
 
 ## How It Works: Core Concepts
 
 ### 1. Lightweight 1D CNN Forecaster
-LapUtil keeps a fixed-length (16 sample) history buffer of CPU load that is normalized around the configurable `target_load`. Each update runs two tiny convolutional layers (kernel width 3, leaky-ReLU activations) followed by global averaging and a fully connected output. The entire pipeline is implemented with fixed-point math so it remains safe for kernel space yet still captures short-term workload trends.
+Baram keeps a fixed-length (16 sample) history buffer of CPU load that is normalized around the configurable `target_load`. Each update runs two tiny convolutional layers (kernel width 3, leaky-ReLU activations) followed by global averaging and a fully connected output. The entire pipeline is implemented with fixed-point math so it remains safe for kernel space yet still captures short-term workload trends.
 
 ### 2. History Normalization & Target Tracking
 Every sample stored in the CNN buffer represents the deviation from the current `target_load`. When the target changes—either because the system switches power source or the user writes a new value—the history is re-initialised so that the network immediately adapts to the new operating point.
 
 ### 3. Hybrid Safety Overrides
-The CNN drives the incremental adjustments, but LapUtil still applies deterministic guard rails. Extremely high load snapshots push the policy straight to the maximum frequency, while near-idle snapshots collapse to the minimum. This prevents the neural network from ever starving the CPU when responsiveness is critical.
+The CNN drives the incremental adjustments, but Baram still applies deterministic guard rails. Extremely high load snapshots push the policy straight to the maximum frequency, while near-idle snapshots collapse to the minimum. This prevents the neural network from ever starving the CPU when responsiveness is critical.
 
 ### 4. Battery-Aware Gain Scheduling
-The same network runs on both AC and battery, but its output is scaled differently. On AC power LapUtil increases both the frequency step size and the neural output gain for snappy response. On battery the gain is reduced and the frequency steps shrink, trading peak performance for sustained efficiency without retraining the model.
+The same network runs on both AC and battery, but its output is scaled differently. On AC power Baram increases both the frequency step size and the neural output gain for snappy response. On battery the gain is reduced and the frequency steps shrink, trading peak performance for sustained efficiency without retraining the model.
 
 ---
 
@@ -74,22 +74,22 @@ patch -p1 < lp-e.patch
 
 ### Temporary Activation (until reboot)
 ```bash
-sudo modprobe cpufreq_laputil
-sudo cpupower frequency-set -g laputil
+sudo modprobe cpufreq_baram
+sudo cpupower frequency-set -g baram
 ```
 
 ### Permanent Activation (at boot)
 ```bash
-echo "cpufreq_laputil" | sudo tee /etc/modules-load.d/laputil.conf
+echo "cpufreq_baram" | sudo tee /etc/modules-load.d/baram.conf
 ```
-(Optionally set LapUtil as the default governor using `cpupower-gui`, TLP, or similar tools.)
+(Optionally set Baram as the default governor using `cpupower-gui`, TLP, or similar tools.)
 
 ---
 
 ## Tunables (via Sysfs)
 
 Available under:  
-`/sys/devices/system/cpu/cpufreq/policy*/laputil/`  
+`/sys/devices/system/cpu/cpufreq/policy*/baram/`
 
 | Parameter              | Description                                                          | Default |
 | ---------------------- | -------------------------------------------------------------------- | ------- |

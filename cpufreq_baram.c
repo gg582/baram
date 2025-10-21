@@ -1,6 +1,6 @@
 /*
- * drivers/cpufreq/cpufreq_laputil.c
- * laputil: laptop-oriented conservative governor
+ * drivers/cpufreq/cpufreq_baram.c
+ * baram: laptop-oriented conservative governor
  *
  * Copyright (C) 2025 Lee Yunjin <gzblues61@daum.net>
  *
@@ -152,8 +152,8 @@ static int lap_start(struct cpufreq_policy *policy);
 static void lap_stop(struct cpufreq_policy *policy);
 static int lap_init(struct cpufreq_policy *policy);
 static void lap_exit(struct cpufreq_policy *policy);
-static int laputil_module_init(void);
-static void laputil_module_exit(void);
+static int __init baram_module_init(void);
+static void __exit baram_module_exit(void);
 
 static inline s16 lap_cnn_clamp(s32 value)
 {
@@ -681,7 +681,7 @@ static struct kobj_attribute freq_step_attr = {
     .store = store_freq_step,
 };
 
-static struct attribute *lap_attrs[] = {
+static struct attribute *baram_attrs[] = {
     &freq_step_attr.attr,
     &ignore_nice_load_attr.attr,
     &sampling_down_factor_attr.attr,
@@ -691,9 +691,9 @@ static struct attribute *lap_attrs[] = {
     NULL
 };
 
-static struct attribute_group lap_attr_group = {
-    .attrs = lap_attrs,
-    .name = "laputil"
+static struct attribute_group baram_attr_group = {
+    .attrs = baram_attrs,
+    .name = "baram"
 };
 
 /**
@@ -723,7 +723,7 @@ static int lap_start(struct cpufreq_policy *policy)
     else
         lp->requested_freq = policy->min;
     policy->governor_data = lp;
-    if (sysfs_create_group(&policy->kobj, &lap_attr_group)) {
+    if (sysfs_create_group(&policy->kobj, &baram_attr_group)) {
         kfree(lp);
         policy->governor_data = NULL;
         return -EINVAL;
@@ -741,7 +741,7 @@ static void lap_stop(struct cpufreq_policy *policy)
     struct lap_policy_info *lp = policy->governor_data;
     if (lp) {
         cancel_delayed_work_sync(&lp->work);
-        sysfs_remove_group(&policy->kobj, &lap_attr_group);
+        sysfs_remove_group(&policy->kobj, &baram_attr_group);
         kfree(lp);
         policy->governor_data = NULL;
     }
@@ -766,8 +766,8 @@ static void lap_exit(struct cpufreq_policy *policy)
     return;
 }
 
-static struct cpufreq_governor lap_governor = {
-    .name = "laputil",
+static struct cpufreq_governor baram_governor = {
+    .name = "baram",
     .flags = 0,
     .init = lap_init,
     .exit = lap_exit,
@@ -775,19 +775,19 @@ static struct cpufreq_governor lap_governor = {
     .stop = lap_stop,
 };
 
-static int __init laputil_module_init(void)
+static int __init baram_module_init(void)
 {
-    return cpufreq_register_governor(&lap_governor);
+    return cpufreq_register_governor(&baram_governor);
 }
 
-static void __exit laputil_module_exit(void)
+static void __exit baram_module_exit(void)
 {
-    cpufreq_unregister_governor(&lap_governor);
+    cpufreq_unregister_governor(&baram_governor);
 }
 
 MODULE_AUTHOR("Lee Yunjin <gzblues61@daum.net>");
-MODULE_DESCRIPTION("'cpufreq_laputil' - Conservative-style governor for laptops with lightweight 1D CNN inference");
+MODULE_DESCRIPTION("'cpufreq_baram' - Conservative-style governor for laptops with lightweight 1D CNN inference");
 MODULE_LICENSE("GPL");
 
-module_init(laputil_module_init);
-module_exit(laputil_module_exit);
+module_init(baram_module_init);
+module_exit(baram_module_exit);
