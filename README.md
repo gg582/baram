@@ -1,9 +1,5 @@
 # Baram: An Intelligent, Power-Aware CPU Governor for Laptops
 
-[![DeepSource](https://app.deepsource.com/gh/gg582/laputil.svg/?label=code+coverage&show_trend=true&token=TI2tAytzI2P2dcKbncHMTzfG)](https://app.deepsource.com/gh/gg582/laputil/)  
-[![DeepSource](https://app.deepsource.com/gh/gg582/laputil.svg/?label=active+issues&show_trend=true&token=TI2tAytzI2P2dcKbncHMTzfG)](https://app.deepsource.com/gh/gg582/laputil/)  
-[![DeepSource](https://app.deepsource.com/gh/gg582/laputil.svg/?label=resolved+issues&show_trend=true&token=TI2tAytzI2P2dcKbncHMTzfG)](https://app.deepsource.com/gh/gg582/laputil/)  
-
 **Baram**is a custom CPU frequency governor built for laptops, designed to balance **performance and battery life** more intelligently than traditional load-based governors.
 Instead of reacting only to raw CPU utilization, Baram runs a **lightweight 1D convolutional neural network (CNN)** entirely inside the kernel. The network ingests a short history of normalized load samples and outputs a signed adjustment that nudges the requested frequency toward what the model predicts the workload will need.
 
