@@ -2,9 +2,8 @@
  * drivers/cpufreq/cpufreq_laputil.c
  * laputil: laptop-oriented conservative governor
  *
- * Copyright (C) 2025 Lee Yunjin <gzblues61@daum.net>
- *
- * Conservative-style governor with Adam-inspired optimizer for power efficiency.
+ * Conservative-style governor backed by a lightweight 1D CNN inference engine
+ * that can also adapt its parameters online inside the driver.
  */
 
 #include <linux/module.h>
@@ -25,35 +24,41 @@
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/types.h>
+#include <linux/math64.h>
 #include "include/ac_names_gen.h"
 #include "include/battery.h"
 
 #define FP_SHIFT 16
 #define FP_SCALE (1 << FP_SHIFT)
 
-#define BETA1_FP ((s64)(58982))
-#define BETA2_FP ((s64)(65470))
+#define CNN_Q 10
+#define CNN_ONE (1 << CNN_Q)
+#define CNN_WINDOW 16
+#define CNN_KERNEL_SIZE 3
+#define CNN_CONV1_OUT 2
+#define CNN_CONV2_OUT 1
 
-#define ONE_MINUS_BETA1_FP (FP_SCALE - BETA1_FP)
-#define ONE_MINUS_BETA2_FP (FP_SCALE - BETA2_FP)
+#define CNN_MAX_VALUE  32767
+#define CNN_MIN_VALUE -32768
 
-#define AFS_HIGH_THRESHOLD 200
-#define AFS_LOW_THRESHOLD  50
-
-// Adam learning rate
-#define LAP_DEF_LEARNING_RATE_FP (FP_SCALE / 100)
+#define LAP_DEF_LEARNING_RATE_FP (FP_SCALE / 5)
 #define LAP_MAX_LEARNING_RATE_FP (FP_SCALE)
 
-// New: Target load for the optimizer
 #define LAP_DEF_TARGET_LOAD 50
 
 // Dynamic tuning values for AC vs. Battery
-#define LAP_AC_LEARNING_RATE_FP (FP_SCALE / 50)  // 0.02
-#define LAP_BATTERY_LEARNING_RATE_FP (FP_SCALE / 200) // 0.005
+#define LAP_AC_LEARNING_RATE_FP (FP_SCALE / 4)  // 0.25 gain on AC
+#define LAP_BATTERY_LEARNING_RATE_FP (FP_SCALE / 8) // 0.125 gain on battery
 #define LAP_AC_FREQ_STEP 10
 #define LAP_BATTERY_FREQ_STEP 3
 #define LAP_AC_TARGET_LOAD 70
 #define LAP_BATTERY_TARGET_LOAD 30
+
+#define LAP_HIGH_LOAD_BYPASS 95
+#define LAP_LOW_LOAD_BYPASS   5
+
+#define LAP_TRAIN_RATE_SHIFT 12
+#define LAP_TRAIN_BIAS_SHIFT 8
 
 struct lap_cpu_dbs {
     u64 prev_cpu_idle;
@@ -68,6 +73,8 @@ static DEFINE_MUTEX(lap_global_lock);
 static unsigned int lap_global_load;
 static bool lap_on_ac_power;
 
+static DEFINE_MUTEX(lap_cnn_weight_lock);
+
 struct lap_tuners {
     unsigned int freq_step;
     unsigned int sampling_down_factor;
@@ -77,16 +84,45 @@ struct lap_tuners {
     unsigned int target_load;
 };
 
+struct lap_cnn_state {
+    s16 history[CNN_WINDOW];
+};
+
 struct lap_policy_info {
     struct cpufreq_policy *policy;
     unsigned int requested_freq;
-    unsigned int prev_load;
-    s64          v_fp;
-    s64          m_fp;
     struct lap_tuners tuners;
+    struct lap_cnn_state cnn;
+    unsigned int last_target_load;
     struct delayed_work work;
     struct mutex lock;
+    bool cnn_has_prediction;
+    s16 cnn_last_prediction;
+    s32 cnn_last_avg;
 };
+
+#if CNN_CONV2_OUT != 1
+#error "Current implementation expects a single output channel"
+#endif
+
+static s16 lap_cnn_conv1_weights[CNN_CONV1_OUT][CNN_KERNEL_SIZE] = {
+    { -256, 0, 256 },
+    { 128, 256, 128 },
+};
+
+static s16 lap_cnn_conv1_bias[CNN_CONV1_OUT] = { 0, 0 };
+
+static s16 lap_cnn_conv2_weights[CNN_CONV2_OUT][CNN_CONV1_OUT][CNN_KERNEL_SIZE] = {
+    {
+        { -192, 0, 192 },
+        { 64, 128, 64 },
+    },
+};
+
+static s16 lap_cnn_conv2_bias[CNN_CONV2_OUT] = { 0 };
+
+static s16 lap_cnn_fc_weight = 768; /* ~0.75 in Q10 */
+static s16 lap_cnn_fc_bias = 0;
 
 #define LAP_DEF_FREQ_STEP          5
 #define LAP_MAX_FREQ_STEP_PERCENT  25
@@ -94,14 +130,17 @@ struct lap_policy_info {
 #define LAP_DEF_SAMPLING_DOWN_FAC  2
 #define LAP_MAX_SAMPLING_DOWN_FAC  5
 #define LAP_DEF_SAMPLING_RATE      1
-#define LAP_DEF_LOAD_EMA_ALPHA_SCALING_FACTOR 3
 
 /* Function Prototypes */
-static void update_adam_momentum(s64 gradient, struct lap_policy_info *lp);
 static inline unsigned int lap_get_freq_step_khz(struct lap_tuners *tuners, struct cpufreq_policy *policy);
 static unsigned int lap_dbs_get_load(bool ignore_nice);
-static u64 isqrt(u64 n);
-static void lap_apply_adam_policy(struct cpufreq_policy *policy, struct lap_policy_info *lp);
+static s16 lap_cnn_scale_load(unsigned int load, unsigned int target);
+static void lap_cnn_init(struct lap_cnn_state *state, s16 initial_sample);
+static void lap_cnn_reset_state(struct lap_policy_info *lp, s16 initial_sample);
+static void lap_cnn_push(struct lap_cnn_state *state, s16 sample);
+static s16 lap_cnn_predict(const struct lap_cnn_state *state, s32 *avg_out);
+static void lap_cnn_train(struct lap_policy_info *lp, s16 actual_sample);
+static void lap_apply_cnn_policy(struct cpufreq_policy *policy, struct lap_policy_info *lp, unsigned int load, s16 cnn_sample);
 static unsigned long cs_dbs_update(struct cpufreq_policy *policy);
 static void lap_work_handler(struct work_struct *work);
 
@@ -122,17 +161,32 @@ static int lap_start(struct cpufreq_policy *policy);
 static void lap_stop(struct cpufreq_policy *policy);
 static int lap_init(struct cpufreq_policy *policy);
 static void lap_exit(struct cpufreq_policy *policy);
-static int laputil_module_init(void);
-static void laputil_module_exit(void);
+static int __init laputil_module_init(void);
+static void __exit laputil_module_exit(void);
 
-/* update_adam_momentum - Update Adam momentum values from load gradient */
-static void update_adam_momentum(s64 gradient, struct lap_policy_info *lp)
+static inline s16 lap_cnn_clamp(s32 value)
 {
-    s64 gradient_sq = div64_s64(gradient * gradient, FP_SCALE);
-    lp->m_fp = (((BETA1_FP * lp->m_fp) >> FP_SHIFT) +
-            ((ONE_MINUS_BETA1_FP * gradient) >> FP_SHIFT));
-    lp->v_fp = (((BETA2_FP * lp->v_fp) >> FP_SHIFT) +
-            ((ONE_MINUS_BETA2_FP * gradient_sq) >> FP_SHIFT));
+    if (value > CNN_MAX_VALUE)
+        value = CNN_MAX_VALUE;
+    else if (value < CNN_MIN_VALUE)
+        value = CNN_MIN_VALUE;
+    return (s16)value;
+}
+
+static inline s16 lap_cnn_activate(s32 value)
+{
+    if (value >= 0) {
+        if (value > CNN_MAX_VALUE)
+            value = CNN_MAX_VALUE;
+        return (s16)value;
+    }
+
+    value >>= 2; /* Leaky behaviour for negative inputs */
+    if (value < CNN_MIN_VALUE)
+        value = CNN_MIN_VALUE;
+    if (value > CNN_MAX_VALUE)
+        value = CNN_MAX_VALUE;
+    return (s16)value;
 }
 
 /* lap_get_freq_step_khz - Compute freq step in kHz from percent */
@@ -166,7 +220,7 @@ static unsigned int lap_dbs_get_load(bool ignore_nice)
         time_elapsed = (unsigned int)(cur_time - cdbs->prev_update_time);
         idle_delta = (unsigned int)(cur_idle - cdbs->prev_cpu_idle);
         nice_delta = (unsigned int)(cur_nice - cdbs->prev_cpu_nice);
-        
+
         if (unlikely(time_elapsed == 0)) {
             cur_load = 100;
         } else {
@@ -175,11 +229,11 @@ static unsigned int lap_dbs_get_load(bool ignore_nice)
                 busy_time -= nice_delta;
             cur_load = 100 * busy_time / time_elapsed;
         }
-        
+
         cdbs->prev_cpu_idle = cur_idle;
         cdbs->prev_cpu_nice = cur_nice;
         cdbs->prev_update_time = cur_time;
-        
+
         load_sum += cur_load;
     }
 
@@ -195,14 +249,14 @@ static void lap_is_on_ac(void)
     struct power_supply *psy;
     union power_supply_propval val;
     int i;
-    
+
     lap_on_ac_power = false;
 
     for (i = 0; i < ARRAY_SIZE(ac_names) && ac_names[i] != NULL; i++) {
         psy = power_supply_get_by_name(ac_names[i]);
         if (!psy)
             continue;
-        
+
         if (power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val) == 0 && val.intval) {
             lap_on_ac_power = true;
         }
@@ -214,50 +268,168 @@ static void lap_is_on_ac(void)
     }
 }
 
-
-// isqrt - integer square root
-static u64 isqrt(u64 n)
+static s16 lap_cnn_scale_load(unsigned int load, unsigned int target)
 {
-    u64 root = 0;
-    u64 bit;
-    u64 trial;
-    bit = (n > 0xFFFFFFFFUL) ? (1UL << 62) : (1UL << 30);
-    while (bit > n)
-        bit >>= 2;
-    for (; bit != 0; bit >>= 2) {
-        trial = root + bit;
-        root >>= 1;
-        if (n >= trial) {
-            n -= trial;
-            root += bit;
-        }
-    }
-    return root;
+    s64 diff = (s64)load - target;
+    s64 scaled = diff * CNN_ONE;
+
+    scaled = div_s64(scaled, 100);
+    scaled = clamp_t(s64, scaled, CNN_MIN_VALUE, CNN_MAX_VALUE);
+
+    return (s16)scaled;
 }
 
-/* lap_apply_adam_policy - determine next freq step via optimizer */
-static void lap_apply_adam_policy(struct cpufreq_policy *policy, struct lap_policy_info *lp)
+static void lap_cnn_init(struct lap_cnn_state *state, s16 initial_sample)
+{
+    int i;
+
+    for (i = 0; i < CNN_WINDOW; i++)
+        state->history[i] = initial_sample;
+}
+
+static void lap_cnn_reset_state(struct lap_policy_info *lp, s16 initial_sample)
+{
+    lap_cnn_init(&lp->cnn, initial_sample);
+    lp->cnn_has_prediction = false;
+    lp->cnn_last_prediction = initial_sample;
+    lp->cnn_last_avg = 0;
+}
+
+static void lap_cnn_push(struct lap_cnn_state *state, s16 sample)
+{
+    memmove(&state->history[0], &state->history[1],
+        (CNN_WINDOW - 1) * sizeof(state->history[0]));
+    state->history[CNN_WINDOW - 1] = sample;
+}
+
+static s16 lap_cnn_predict(const struct lap_cnn_state *state, s32 *avg_out)
+{
+    s16 conv1_out[CNN_CONV1_OUT][CNN_WINDOW];
+    s16 conv2_out[CNN_WINDOW];
+    s32 acc;
+    int pos, k, oc, ic;
+    int pad = CNN_KERNEL_SIZE / 2;
+    s16 sample;
+    s64 sum = 0;
+    s64 avg64;
+    s32 avg32;
+    s32 fc_acc;
+
+    for (oc = 0; oc < CNN_CONV1_OUT; oc++) {
+        for (pos = 0; pos < CNN_WINDOW; pos++) {
+            acc = (s32)lap_cnn_conv1_bias[oc] << CNN_Q;
+            for (k = 0; k < CNN_KERNEL_SIZE; k++) {
+                int idx = pos + k - pad;
+
+                if (idx < 0)
+                    sample = state->history[0];
+                else if (idx >= CNN_WINDOW)
+                    sample = state->history[CNN_WINDOW - 1];
+                else
+                    sample = state->history[idx];
+
+                acc += (s32)lap_cnn_conv1_weights[oc][k] * sample;
+            }
+
+            conv1_out[oc][pos] = lap_cnn_activate(acc >> CNN_Q);
+        }
+    }
+
+    for (pos = 0; pos < CNN_WINDOW; pos++) {
+        acc = (s32)lap_cnn_conv2_bias[0] << CNN_Q;
+        for (ic = 0; ic < CNN_CONV1_OUT; ic++) {
+            for (k = 0; k < CNN_KERNEL_SIZE; k++) {
+                int idx = pos + k - pad;
+
+                if (idx < 0)
+                    sample = conv1_out[ic][0];
+                else if (idx >= CNN_WINDOW)
+                    sample = conv1_out[ic][CNN_WINDOW - 1];
+                else
+                    sample = conv1_out[ic][idx];
+
+                acc += (s32)lap_cnn_conv2_weights[0][ic][k] * sample;
+            }
+        }
+
+        conv2_out[pos] = lap_cnn_clamp(acc >> CNN_Q);
+        sum += conv2_out[pos];
+    }
+
+    avg64 = div_s64(sum, CNN_WINDOW);
+    avg64 = clamp_t(s64, avg64, CNN_MIN_VALUE, CNN_MAX_VALUE);
+    avg32 = (s32)avg64;
+
+    if (avg_out)
+        *avg_out = avg32;
+
+    fc_acc = ((s32)lap_cnn_fc_bias << CNN_Q) + (s32)lap_cnn_fc_weight * avg32;
+    return lap_cnn_clamp(fc_acc >> CNN_Q);
+}
+
+static void lap_cnn_train(struct lap_policy_info *lp, s16 actual_sample)
+{
+    s32 error;
+    s32 delta_w;
+    s32 delta_b;
+    s32 new_weight;
+    s32 new_bias;
+
+    if (!lp->cnn_has_prediction)
+        return;
+
+    error = (s32)actual_sample - (s32)lp->cnn_last_prediction;
+    if (error == 0)
+        goto out_clear;
+
+    mutex_lock(&lap_cnn_weight_lock);
+
+    delta_w = (s32)(((s64)error * lp->cnn_last_avg) >> (CNN_Q + LAP_TRAIN_RATE_SHIFT));
+    delta_b = (s32)(((s64)error) >> LAP_TRAIN_BIAS_SHIFT);
+
+    new_weight = (s32)lap_cnn_fc_weight + delta_w;
+    new_bias = (s32)lap_cnn_fc_bias + delta_b;
+
+    lap_cnn_fc_weight = (s16)clamp_t(s32, new_weight, CNN_MIN_VALUE, CNN_MAX_VALUE);
+    lap_cnn_fc_bias = (s16)clamp_t(s32, new_bias, CNN_MIN_VALUE, CNN_MAX_VALUE);
+
+    mutex_unlock(&lap_cnn_weight_lock);
+
+out_clear:
+    lp->cnn_has_prediction = false;
+}
+
+static void lap_apply_cnn_policy(struct cpufreq_policy *policy,
+                 struct lap_policy_info *lp, unsigned int load, s16 cnn_sample)
 {
     unsigned int requested_freq = lp->requested_freq;
     unsigned int step_khz = lap_get_freq_step_khz(&lp->tuners, policy);
-    s64 update_vector = 0;
-    s64 trend_fp = lp->m_fp;
-    s64 volatility_fp = lp->v_fp;
-    s64 scaled_update_fp;
-    
-    if (volatility_fp > 0) {
-        u64 sqrt_v = isqrt((u64)volatility_fp >> FP_SHIFT);
-        if (sqrt_v > 0) {
-            s64 scaled_trend = (lp->tuners.learning_rate_fp * trend_fp) >> FP_SHIFT;
-            update_vector = div64_s64(scaled_trend, sqrt_v);
-        }
+    s16 cnn_output = 0;
+    s32 avg32 = 0;
+    s64 scaled_delta;
+    s64 delta_khz;
+
+    lap_cnn_push(&lp->cnn, cnn_sample);
+
+    if (load >= LAP_HIGH_LOAD_BYPASS) {
+        requested_freq = policy->max;
+        lp->cnn_has_prediction = false;
+    } else if (load <= LAP_LOW_LOAD_BYPASS) {
+        requested_freq = policy->min;
+        lp->cnn_has_prediction = false;
+    } else {
+        cnn_output = lap_cnn_predict(&lp->cnn, &avg32);
+
+        scaled_delta = (s64)cnn_output * lp->tuners.learning_rate_fp;
+        delta_khz = (scaled_delta * step_khz) >> (CNN_Q + FP_SHIFT);
+
+        requested_freq = clamp_val((s64)requested_freq + delta_khz,
+                       policy->min, policy->max);
+
+        lp->cnn_last_prediction = cnn_output;
+        lp->cnn_last_avg = avg32;
+        lp->cnn_has_prediction = true;
     }
-    
-    scaled_update_fp = clamp_t(s64, update_vector, -AFS_HIGH_THRESHOLD, AFS_HIGH_THRESHOLD);
-    
-    requested_freq += (scaled_update_fp * step_khz) >> FP_SHIFT;
-    
-    requested_freq = clamp_val(requested_freq, policy->min, policy->max);
 
     if (requested_freq != lp->requested_freq) {
         cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_L);
@@ -271,47 +443,46 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
     struct lap_policy_info *lp = policy->governor_data;
     struct lap_tuners *tuners;
     unsigned int load;
-    s64 load_error;
-    
+    s16 cnn_sample;
+    bool target_changed = false;
+
     if (!lp)
         return HZ;
+
     tuners = &lp->tuners;
     mutex_lock(&lp->lock);
-    
-    // Step 1: Update power source status (only on CPU0 to prevent race conditions)
-    if (policy->cpu == 0) {
+
+    if (policy->cpu == 0)
         lap_is_on_ac();
-    }
-    
-    // Step 2: Dynamically adjust tuners based on power source
+
     if (lap_on_ac_power) {
-        lp->tuners.learning_rate_fp = LAP_AC_LEARNING_RATE_FP;
-        lp->tuners.freq_step = LAP_AC_FREQ_STEP;
-        lp->tuners.target_load = LAP_AC_TARGET_LOAD;
+        tuners->learning_rate_fp = LAP_AC_LEARNING_RATE_FP;
+        tuners->freq_step = LAP_AC_FREQ_STEP;
+        tuners->target_load = LAP_AC_TARGET_LOAD;
     } else {
-        lp->tuners.learning_rate_fp = LAP_BATTERY_LEARNING_RATE_FP;
-        lp->tuners.freq_step = LAP_BATTERY_FREQ_STEP;
-        lp->tuners.target_load = LAP_BATTERY_TARGET_LOAD;
+        tuners->learning_rate_fp = LAP_BATTERY_LEARNING_RATE_FP;
+        tuners->freq_step = LAP_BATTERY_FREQ_STEP;
+        tuners->target_load = LAP_BATTERY_TARGET_LOAD;
     }
 
-    // Step 3: Compute system-wide CPU load (Only one policy updates)
     mutex_lock(&lap_global_lock);
-    lap_global_load = lap_dbs_get_load(lp->tuners.ignore_nice_load);
+    lap_global_load = lap_dbs_get_load(tuners->ignore_nice_load);
     mutex_unlock(&lap_global_lock);
 
     load = lap_global_load;
-    
-    int load_delta = load - lp->prev_load;
-    u8 ema_alpha = (load_delta + 100) / LAP_DEF_LOAD_EMA_ALPHA_SCALING_FACTOR;
-    ema_alpha = ema_alpha < 30 ? 30 : ema_alpha;
-    
-    load_error = load - lp->tuners.target_load;
-    
-    update_adam_momentum(load_error, lp);
+    cnn_sample = lap_cnn_scale_load(load, tuners->target_load);
 
-    lap_apply_adam_policy(policy, lp);
+    if (lp->last_target_load != tuners->target_load) {
+        lap_cnn_reset_state(lp, cnn_sample);
+        lp->last_target_load = tuners->target_load;
+        target_changed = true;
+    }
 
-    lp->prev_load = load;
+    if (!target_changed)
+        lap_cnn_train(lp, cnn_sample);
+
+    lap_apply_cnn_policy(policy, lp, load, cnn_sample);
+
     mutex_unlock(&lp->lock);
     return (unsigned long)tuners->sampling_rate * HZ;
 }
@@ -362,6 +533,18 @@ static ssize_t store_target_load(struct kobject *kobj, struct kobj_attribute *at
         return -EINVAL;
     mutex_lock(&lp->lock);
     lp->tuners.target_load = val;
+    lp->last_target_load = val;
+    {
+        unsigned int current_load;
+        s16 reset_sample;
+
+        mutex_lock(&lap_global_lock);
+        current_load = lap_global_load;
+        mutex_unlock(&lap_global_lock);
+
+        reset_sample = lap_cnn_scale_load(current_load, val);
+        lap_cnn_reset_state(lp, reset_sample);
+    }
     mutex_unlock(&lp->lock);
     return count;
 }
@@ -562,7 +745,7 @@ static struct kobj_attribute freq_step_attr = {
     .store = store_freq_step,
 };
 
-static struct attribute *lap_attrs[] = {
+static struct attribute *laputil_attrs[] = {
     &freq_step_attr.attr,
     &ignore_nice_load_attr.attr,
     &sampling_down_factor_attr.attr,
@@ -572,8 +755,8 @@ static struct attribute *lap_attrs[] = {
     NULL
 };
 
-static struct attribute_group lap_attr_group = {
-    .attrs = lap_attrs,
+static struct attribute_group laputil_attr_group = {
+    .attrs = laputil_attrs,
     .name = "laputil"
 };
 
@@ -597,8 +780,14 @@ static int lap_start(struct cpufreq_policy *policy)
     lp->tuners.sampling_rate = LAP_DEF_SAMPLING_RATE;
     lp->tuners.learning_rate_fp = LAP_DEF_LEARNING_RATE_FP;
     lp->tuners.target_load = LAP_DEF_TARGET_LOAD;
+    lp->last_target_load = lp->tuners.target_load;
+    lap_cnn_reset_state(lp, 0);
+    if (policy->cur)
+        lp->requested_freq = policy->cur;
+    else
+        lp->requested_freq = policy->min;
     policy->governor_data = lp;
-    if (sysfs_create_group(&policy->kobj, &lap_attr_group)) {
+    if (sysfs_create_group(&policy->kobj, &laputil_attr_group)) {
         kfree(lp);
         policy->governor_data = NULL;
         return -EINVAL;
@@ -616,7 +805,7 @@ static void lap_stop(struct cpufreq_policy *policy)
     struct lap_policy_info *lp = policy->governor_data;
     if (lp) {
         cancel_delayed_work_sync(&lp->work);
-        sysfs_remove_group(&policy->kobj, &lap_attr_group);
+        sysfs_remove_group(&policy->kobj, &laputil_attr_group);
         kfree(lp);
         policy->governor_data = NULL;
     }
@@ -641,7 +830,7 @@ static void lap_exit(struct cpufreq_policy *policy)
     return;
 }
 
-static struct cpufreq_governor lap_governor = {
+static struct cpufreq_governor laputil_governor = {
     .name = "laputil",
     .flags = 0,
     .init = lap_init,
@@ -652,16 +841,16 @@ static struct cpufreq_governor lap_governor = {
 
 static int __init laputil_module_init(void)
 {
-    return cpufreq_register_governor(&lap_governor);
+    return cpufreq_register_governor(&laputil_governor);
 }
 
 static void __exit laputil_module_exit(void)
 {
-    cpufreq_unregister_governor(&lap_governor);
+    cpufreq_unregister_governor(&laputil_governor);
 }
 
 MODULE_AUTHOR("Lee Yunjin <gzblues61@daum.net>");
-MODULE_DESCRIPTION("'cpufreq_laputil' - Conservative-style governor for laptops (with adam-inspired optimizer)");
+MODULE_DESCRIPTION("'cpufreq_laputil' - Conservative-style governor with adaptive 1D CNN");
 MODULE_LICENSE("GPL");
 
 module_init(laputil_module_init);
