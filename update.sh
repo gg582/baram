@@ -1,6 +1,6 @@
 #!/bin/bash
 
-MODULE_NAME="laputil"
+MODULE_NAME="cpufreq_baram"
 MODULE_VERSION="1.0"  # Change to match dkms.conf PACKAGE_VERSION
 CUR_DIR=$(pwd)
 DKMS_DIR="/usr/src/${MODULE_NAME}-${MODULE_VERSION}"
