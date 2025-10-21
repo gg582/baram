@@ -4,39 +4,24 @@
 [![DeepSource](https://app.deepsource.com/gh/gg582/laputil.svg/?label=active+issues&show_trend=true&token=TI2tAytzI2P2dcKbncHMTzfG)](https://app.deepsource.com/gh/gg582/laputil/)  
 [![DeepSource](https://app.deepsource.com/gh/gg582/laputil.svg/?label=resolved+issues&show_trend=true&token=TI2tAytzI2P2dcKbncHMTzfG)](https://app.deepsource.com/gh/gg582/laputil/)  
 
-**LapUtil** is a custom CPU frequency governor built for laptops, designed to balance **performance and battery life** more intelligently than traditional load-based governors.  
-Instead of reacting only to raw CPU utilization, LapUtil employs a **predictive, Adam-inspired optimizer** combined with **dynamic load smoothing** and **hybrid safety heuristics**.  
+**LapUtil** is a custom CPU frequency governor built for laptops, designed to balance **performance and battery life** more intelligently than traditional load-based governors.
+Instead of reacting only to raw CPU utilization, LapUtil runs a **lightweight 1D convolutional neural network (CNN)** entirely inside the kernel. The network ingests a short history of normalized load samples and outputs a signed adjustment that nudges the requested frequency toward what the model predicts the workload will need.
 
 ---
 
 ## How It Works: Core Concepts
 
-### 1. Adam-Inspired Predictive Optimizer
-LapUtil adapts the ideas of the *Adam* optimizer from machine learning to manage CPU frequency using **power consumption trends**, not just CPU load.  
+### 1. Lightweight 1D CNN Forecaster
+LapUtil keeps a fixed-length (16 sample) history buffer of CPU load that is normalized around the configurable `target_load`. Each update runs two tiny convolutional layers (kernel width 3, leaky-ReLU activations) followed by global averaging and a fully connected output. The entire pipeline is implemented with fixed-point math so it remains safe for kernel space yet still captures short-term workload trends.
 
-- **m (Momentum):** Tracks the *average directional trend* of power consumption: rising, stable, or falling.  
-- **v (Volatility):** Measures how *unstable or spiky* the power usage is.  
+### 2. History Normalization & Target Tracking
+Every sample stored in the CNN buffer represents the deviation from the current `target_load`. When the target changes—either because the system switches power source or the user writes a new value—the history is re-initialised so that the network immediately adapts to the new operating point.
 
-By combining these factors in an `m / sqrt(v)`-like manner, LapUtil responds only to **sustained changes** in power usage, avoiding jitter from short spikes while anticipating future demand.  
+### 3. Hybrid Safety Overrides
+The CNN drives the incremental adjustments, but LapUtil still applies deterministic guard rails. Extremely high load snapshots push the policy straight to the maximum frequency, while near-idle snapshots collapse to the minimum. This prevents the neural network from ever starving the CPU when responsiveness is critical.
 
-### 2. Dynamic Load Smoothing (EMA)
-Minor load fluctuations shouldn't cause frequent frequency jumps. LapUtil applies an **Exponential Moving Average (EMA)** to CPU load, but with a twist:  
-
-- **High load volatility:** The smoothing factor (alpha) increases, making the governor more responsive.  
-- **Stable load:** Alpha decreases, keeping frequencies steady and efficient.  
-
-This adaptive EMA prevents jitter while remaining agile when needed.  
-
-### 3. Hybrid Heuristics & Overrides
-To ensure responsiveness in edge cases, LapUtil blends predictive optimization with traditional load-based rules:  
-
-- **High Load Override:** If load exceeds `up_threshold`, LapUtil immediately boosts frequency for responsiveness.  
-- **Low Load Override:** If load drops below `down_threshold`, frequency is reduced quickly for maximum efficiency.  
-
-### 4. Battery & Cluster Awareness
-- **On Battery:** Predictive optimization is enabled to extend runtime.  
-- **On AC Power:** The optimizer is bypassed, favoring raw performance.  
-- **P-cores / E-cores:** When battery is low, LapUtil prioritizes efficiency cores (E-cores) to reduce power draw further.  
+### 4. Battery-Aware Gain Scheduling
+The same network runs on both AC and battery, but its output is scaled differently. On AC power LapUtil increases both the frequency step size and the neural output gain for snappy response. On battery the gain is reduced and the frequency steps shrink, trading peak performance for sustained efficiency without retraining the model.
 
 ---
 
@@ -108,12 +93,12 @@ Available under:
 
 | Parameter              | Description                                                          | Default |
 | ---------------------- | -------------------------------------------------------------------- | ------- |
-| `up_threshold`         | CPU load (%) above which frequency is raised                        | 75      |
-| `down_threshold`       | CPU load (%) below which frequency is lowered                       | 10      |
 | `freq_step`            | Step size for frequency change, as % of max frequency               | 5       |
 | `sampling_rate`        | Sampling period (seconds)                                           | 1       |
 | `sampling_down_factor` | Multiplier applied to sampling rate when scaling frequency down     | 2       |
 | `ignore_nice_load`     | Ignore `nice` processes in load calculation (1 = ignore)            | 1       |
+| `target_load`          | Load (%) the CNN keeps as its neutral reference                     | 50      |
+| `learning_rate`        | Gain applied to the CNN output (scaled in thousandths)              | 200     |
 
 ---
 
