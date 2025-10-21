@@ -7,6 +7,9 @@
 **Baram** (formerly LapUtil) is a custom CPU frequency governor built for laptops, designed to balance **performance and battery life** more intelligently than traditional load-based governors.
 Instead of reacting only to raw CPU utilization, Baram runs a **lightweight 1D convolutional neural network (CNN)** entirely inside the kernel. The network ingests a short history of normalized load samples and outputs a signed adjustment that nudges the requested frequency toward what the model predicts the workload will need.
 
+## GeekBench 6(compared to conservative)
+![Comparison](./imgs/geekbench-compared-to-conservative.png)
+
 ---
 
 ## How It Works: Core Concepts
