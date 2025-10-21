@@ -10,6 +10,7 @@ Instead of reacting only to raw CPU utilization, Baram runs a **lightweight 1D c
 ## GeekBench 6(compared to conservative)
 ![Comparison](./imgs/geekbench-compared-to-conservative.png)
 ![Comparison_SC](./imgs/geekbench-compared-to-conservative-sc.png)
+**You can try train-and-inference branch too**
 
 ---
 
