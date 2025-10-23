@@ -99,6 +99,8 @@ struct lap_policy_info {
     bool cnn_has_prediction;
     s16 cnn_last_prediction;
     s32 cnn_last_avg;
+    bool cnn_has_history;
+    s16 cnn_smoothed_output;
 };
 
 #if CNN_CONV2_OUT != 1
@@ -293,6 +295,8 @@ static void lap_cnn_reset_state(struct lap_policy_info *lp, s16 initial_sample)
     lp->cnn_has_prediction = false;
     lp->cnn_last_prediction = initial_sample;
     lp->cnn_last_avg = 0;
+    lp->cnn_has_history = false;
+    lp->cnn_smoothed_output = initial_sample;
 }
 
 static void lap_cnn_push(struct lap_cnn_state *state, s16 sample)
@@ -408,19 +412,31 @@ static void lap_apply_cnn_policy(struct cpufreq_policy *policy,
     s32 avg32 = 0;
     s64 scaled_delta;
     s64 delta_khz;
+    s32 applied_output;
 
     lap_cnn_push(&lp->cnn, cnn_sample);
 
     if (load >= LAP_HIGH_LOAD_BYPASS) {
         requested_freq = policy->max;
         lp->cnn_has_prediction = false;
+        lp->cnn_has_history = false;
     } else if (load <= LAP_LOW_LOAD_BYPASS) {
         requested_freq = policy->min;
         lp->cnn_has_prediction = false;
+        lp->cnn_has_history = false;
     } else {
         cnn_output = lap_cnn_predict(&lp->cnn, &avg32);
 
-        scaled_delta = (s64)cnn_output * lp->tuners.learning_rate_fp;
+        applied_output = cnn_output;
+        if (lp->cnn_has_history) {
+            applied_output = (3 * (s32)lp->cnn_smoothed_output + applied_output) >> 2;
+            applied_output = (s32)lap_cnn_clamp(applied_output);
+        }
+
+        lp->cnn_smoothed_output = lap_cnn_clamp(applied_output);
+        lp->cnn_has_history = true;
+
+        scaled_delta = (s64)lp->cnn_smoothed_output * lp->tuners.learning_rate_fp;
         delta_khz = (scaled_delta * step_khz) >> (CNN_Q + FP_SHIFT);
 
         requested_freq = clamp_val((s64)requested_freq + delta_khz,
