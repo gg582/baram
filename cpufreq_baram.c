@@ -367,9 +367,21 @@ static void lap_apply_cnn_policy(struct cpufreq_policy *policy,
         requested_freq = policy->min;
     } else {
         cnn_output = lap_cnn_predict(&lp->cnn);
+        /*
+         * Avoid overly aggressive corrections when the CNN saturates by
+         * bounding its output to the nominal [-1.0, 1.0] range.
+         */
+        cnn_output = clamp_t(s16, cnn_output, -CNN_ONE, CNN_ONE);
 
         scaled_delta = (s64)cnn_output * lp->tuners.learning_rate_fp;
         delta_khz = (scaled_delta * step_khz) >> (CNN_Q + FP_SHIFT);
+        /*
+         * Apply an additional rate limit so that a single update cannot jump
+         * more than one frequency step in either direction. This prevents the
+         * governor from bouncing between policy extremes when the predictor is
+         * momentarily unstable.
+         */
+        delta_khz = clamp_t(s64, delta_khz, -(s64)step_khz, (s64)step_khz);
 
         requested_freq = clamp_val((s64)requested_freq + delta_khz,
                        policy->min, policy->max);
