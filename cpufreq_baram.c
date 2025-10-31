@@ -4,7 +4,7 @@
  *
  * Copyright (C) 2025 Lee Yunjin <gzblues61@daum.net>
  *
- * Conservative-style governor backed by a lightweight 1D CNN inference engine.
+ * Conservative-style governor backed by a lightweight LSTM inference engine.
  */
 
 #include <linux/module.h>
@@ -32,15 +32,13 @@
 #define FP_SHIFT 16
 #define FP_SCALE (1 << FP_SHIFT)
 
-#define CNN_Q 10
-#define CNN_ONE (1 << CNN_Q)
-#define CNN_WINDOW 16
-#define CNN_KERNEL_SIZE 3
-#define CNN_CONV1_OUT 2
-#define CNN_CONV2_OUT 1
+#define LSTM_Q 10
+#define LSTM_ONE (1 << LSTM_Q)
+#define LSTM_WINDOW 16
+#define LSTM_HIDDEN_SIZE 4
 
-#define CNN_MAX_VALUE  32767
-#define CNN_MIN_VALUE -32768
+#define LSTM_MAX_VALUE  32767
+#define LSTM_MIN_VALUE -32768
 
 #define LAP_DEF_LEARNING_RATE_FP (FP_SCALE / 5)
 #define LAP_MAX_LEARNING_RATE_FP (FP_SCALE)
@@ -80,42 +78,62 @@ struct lap_tuners {
     unsigned int target_load;
 };
 
-struct lap_cnn_state {
-    s16 history[CNN_WINDOW];
+struct lap_lstm_state {
+    s16 history[LSTM_WINDOW];
+    s16 hidden[LSTM_HIDDEN_SIZE];
+    s16 cell[LSTM_HIDDEN_SIZE];
 };
 
 struct lap_policy_info {
     struct cpufreq_policy *policy;
     unsigned int requested_freq;
     struct lap_tuners tuners;
-    struct lap_cnn_state cnn;
+    struct lap_lstm_state lstm;
     unsigned int last_target_load;
     struct delayed_work work;
     struct mutex lock;
+    struct cpumask eff_mask;  /* Efficiency cores mask */
+    struct cpumask perf_mask; /* Performance cores mask */
+    struct cpumask lp_eff_mask;
 };
 
-#if CNN_CONV2_OUT != 1
-#error "Current implementation expects a single output channel"
-#endif
+static const s16 lap_lstm_wg_i[LSTM_HIDDEN_SIZE] = { 128, 128, 128, 128 };
+static const s16 lap_lstm_wg_f[LSTM_HIDDEN_SIZE] = { 128, 128, 128, 128 };
+static const s16 lap_lstm_wg_c[LSTM_HIDDEN_SIZE] = { 128, 128, 128, 128 };
+static const s16 lap_lstm_wg_o[LSTM_HIDDEN_SIZE] = { 128, 128, 128, 128 };
 
-static const s16 lap_cnn_conv1_weights[CNN_CONV1_OUT][CNN_KERNEL_SIZE] = {
-    { -256, 0, 256 },
-    { 128, 256, 128 },
+static const s16 lap_lstm_wh_i[LSTM_HIDDEN_SIZE][LSTM_HIDDEN_SIZE] = {
+    { 128, 128, 128, 128 },
+    { 128, 128, 128, 128 },
+    { 128, 128, 128, 128 },
+    { 128, 128, 128, 128 },
+};
+static const s16 lap_lstm_wh_f[LSTM_HIDDEN_SIZE][LSTM_HIDDEN_SIZE] = {
+    { 128, 128, 128, 128 },
+    { 128, 128, 128, 128 },
+    { 128, 128, 128, 128 },
+    { 128, 128, 128, 128 },
+};
+static const s16 lap_lstm_wh_c[LSTM_HIDDEN_SIZE][LSTM_HIDDEN_SIZE] = {
+    { 128, 128, 128, 128 },
+    { 128, 128, 128, 128 },
+    { 128, 128, 128, 128 },
+    { 128, 128, 128, 128 },
+};
+static const s16 lap_lstm_wh_o[LSTM_HIDDEN_SIZE][LSTM_HIDDEN_SIZE] = {
+    { 128, 128, 128, 128 },
+    { 128, 128, 128, 128 },
+    { 128, 128, 128, 128 },
+    { 128, 128, 128, 128 },
 };
 
-static const s16 lap_cnn_conv1_bias[CNN_CONV1_OUT] = { 0, 0 };
+static const s16 lap_lstm_b_i[LSTM_HIDDEN_SIZE] = { 0, 0, 0, 0 };
+static const s16 lap_lstm_b_f[LSTM_HIDDEN_SIZE] = { 0, 0, 0, 0 };
+static const s16 lap_lstm_b_c[LSTM_HIDDEN_SIZE] = { 0, 0, 0, 0 };
+static const s16 lap_lstm_b_o[LSTM_HIDDEN_SIZE] = { 0, 0, 0, 0 };
 
-static const s16 lap_cnn_conv2_weights[CNN_CONV2_OUT][CNN_CONV1_OUT][CNN_KERNEL_SIZE] = {
-    {
-        { -192, 0, 192 },
-        { 64, 128, 64 },
-    },
-};
-
-static const s16 lap_cnn_conv2_bias[CNN_CONV2_OUT] = { 0 };
-
-static const s16 lap_cnn_fc_weight = 768; /* ~0.75 in Q10 */
-static const s16 lap_cnn_fc_bias = 0;
+static const s16 lap_lstm_fc_weight[LSTM_HIDDEN_SIZE] = { 128, 128, 128, 128 };
+static const s16 lap_lstm_fc_bias = 0;
 
 #define LAP_DEF_FREQ_STEP          5
 #define LAP_MAX_FREQ_STEP_PERCENT  25
@@ -126,14 +144,43 @@ static const s16 lap_cnn_fc_bias = 0;
 
 /* Function Prototypes */
 static inline unsigned int lap_get_freq_step_khz(struct lap_tuners *tuners, struct cpufreq_policy *policy);
-static unsigned int lap_dbs_get_load(bool ignore_nice);
-static s16 lap_cnn_scale_load(unsigned int load, unsigned int target);
-static void lap_cnn_init(struct lap_cnn_state *state, s16 initial_sample);
-static void lap_cnn_push(struct lap_cnn_state *state, s16 sample);
-static s16 lap_cnn_predict(const struct lap_cnn_state *state);
-static void lap_apply_cnn_policy(struct cpufreq_policy *policy, struct lap_policy_info *lp, unsigned int load);
+static unsigned int lap_dbs_get_load(struct cpufreq_policy *policy, bool ignore_nice);
+static bool lap_is_on_ac(int *battery_capacity);
+static s16 lap_lstm_scale_load(unsigned int load, unsigned int target);
+static void lap_lstm_init(struct lap_lstm_state *state, s16 initial_sample);
+static void lap_lstm_push(struct lap_lstm_state *state, s16 sample);
+static s16 lap_lstm_predict(struct lap_lstm_state *state);
+static void lap_apply_lstm_policy(struct cpufreq_policy *policy, struct lap_policy_info *lp, unsigned int load);
 static unsigned long cs_dbs_update(struct cpufreq_policy *policy);
 static void lap_work_handler(struct work_struct *work);
+
+static inline s16 lap_lstm_clamp(s32 value)
+{
+    if (value > LSTM_MAX_VALUE)
+        value = LSTM_MAX_VALUE;
+    else if (value < LSTM_MIN_VALUE)
+        value = LSTM_MIN_VALUE;
+    return (s16)value;
+}
+
+static inline s16 lap_lstm_activate_sigmoid(s32 value)
+{
+    // Simplified sigmoid: 0.5 + 0.25 * x
+    value = (LSTM_ONE / 2) + (value / 4);
+    if (value > LSTM_ONE)
+        return LSTM_ONE;
+    if (value < 0)
+        return 0;
+    return (s16)value;
+}
+
+static inline s16 lap_lstm_activate_tanh(s32 value)
+{
+    // Simplified tanh: x / (1 + |x|)
+    s32 abs_val = abs(value);
+    value = div_s64((s64)value << LSTM_Q, LSTM_ONE + abs_val);
+    return lap_lstm_clamp(value);
+}
 
 // Sysfs functions
 static ssize_t show_sampling_rate(struct kobject *kobj, struct kobj_attribute *attr, char *buf);
@@ -155,30 +202,7 @@ static void lap_exit(struct cpufreq_policy *policy);
 static int __init baram_module_init(void);
 static void __exit baram_module_exit(void);
 
-static inline s16 lap_cnn_clamp(s32 value)
-{
-    if (value > CNN_MAX_VALUE)
-        value = CNN_MAX_VALUE;
-    else if (value < CNN_MIN_VALUE)
-        value = CNN_MIN_VALUE;
-    return (s16)value;
-}
 
-static inline s16 lap_cnn_activate(s32 value)
-{
-    if (value >= 0) {
-        if (value > CNN_MAX_VALUE)
-            value = CNN_MAX_VALUE;
-        return (s16)value;
-    }
-
-    value >>= 2; /* Leaky behaviour for negative inputs */
-    if (value < CNN_MIN_VALUE)
-        value = CNN_MIN_VALUE;
-    if (value > CNN_MAX_VALUE)
-        value = CNN_MAX_VALUE;
-    return (s16)value;
-}
 
 /* lap_get_freq_step_khz - Compute freq step in kHz from percent */
 static inline unsigned int lap_get_freq_step_khz(struct lap_tuners *tuners, struct cpufreq_policy *policy)
@@ -193,55 +217,124 @@ static inline unsigned int lap_get_freq_step_khz(struct lap_tuners *tuners, stru
     return step_khz;
 }
 
-/* lap_dbs_get_load - compute average load (0..100) across all online CPUs */
-static unsigned int lap_dbs_get_load(bool ignore_nice)
+/* Detect efficiency and performance cores based on max frequency */
+static void detect_clusters(struct cpufreq_policy *policy, struct cpumask *eff_mask, struct cpumask * lp_eff_mask, struct cpumask *perf_mask)
 {
-    unsigned int load_sum = 0;
     unsigned int cpu;
-    u64 cur_time;
-    unsigned int time_elapsed;
-    unsigned int cur_load;
-    u64 cur_idle, cur_nice;
-    u64 idle_delta, nice_delta;
+    unsigned int max_freq, min_freq = UINT_MAX, highest_freq = 0;
 
-    for_each_online_cpu(cpu) {
+    cpumask_clear(perf_mask);
+    cpumask_clear(eff_mask);
+    cpumask_clear(lp_eff_mask);
+
+     /* Find min and max CPU frequencies */
+    for_each_cpu(cpu, policy->cpus) {
+        max_freq = cpufreq_quick_get_max(cpu);
+        if (max_freq < min_freq) min_freq = max_freq;
+        if (max_freq > highest_freq) highest_freq = max_freq;
+    }
+
+    /* Assign cores based on frequency tiers */
+    for_each_cpu(cpu, policy->cpus) {
+        max_freq = cpufreq_quick_get_max(cpu);
+        if (max_freq == highest_freq)
+            cpumask_set_cpu(cpu, perf_mask);
+        else if (max_freq == min_freq)
+            cpumask_set_cpu(cpu, lp_eff_mask);
+        else
+            cpumask_set_cpu(cpu, eff_mask);
+    }
+
+     pr_info("Detected clusters: %u Perf, %u E, %u LP-E\n",
+            cpumask_weight(perf_mask),
+            cpumask_weight(eff_mask),
+            cpumask_weight(lp_eff_mask));
+}
+
+/* lap_dbs_get_load - compute average load with 3 cluster weights */
+static unsigned int lap_dbs_get_load(struct cpufreq_policy *policy, bool ignore_nice)
+{
+    struct lap_policy_info *lp = policy->governor_data;
+    unsigned int load_sum = 0, perf_load_sum = 0, e_load_sum = 0, lp_e_load_sum = 0;
+    unsigned int cpu;
+    unsigned int perf_cpus = 0, e_cpus = 0, lp_e_cpus = 0;
+    u64 cur_time, cur_idle, cur_nice, idle_delta, nice_delta;
+    unsigned int time_elapsed, cur_load;
+    int battery_capacity;
+
+    if (!lp || !cpumask_weight(policy->cpus))
+        return 0;
+
+    /* Detect clusters if not initialized */
+    if (cpumask_empty(&lp->perf_mask) || cpumask_empty(&lp->eff_mask) || cpumask_empty(&lp->lp_eff_mask)) {
+        detect_clusters(policy, &lp->eff_mask, &lp->lp_eff_mask, &lp->perf_mask);
+    }
+
+    perf_cpus = cpumask_weight(&lp->perf_mask);
+    e_cpus = cpumask_weight(&lp->eff_mask);
+    lp_e_cpus = cpumask_weight(&lp->lp_eff_mask);
+
+    /* Compute load per CPU */
+    for_each_cpu(cpu, policy->cpus) {
         struct lap_cpu_dbs *cdbs = per_cpu_ptr(&lap_cpu_dbs, cpu);
         cur_idle = get_cpu_idle_time_us(cpu, &cur_time);
         cur_nice = jiffies_to_usecs(kcpustat_cpu(cpu).cpustat[CPUTIME_NICE]);
         time_elapsed = (unsigned int)(cur_time - cdbs->prev_update_time);
         idle_delta = (unsigned int)(cur_idle - cdbs->prev_cpu_idle);
         nice_delta = (unsigned int)(cur_nice - cdbs->prev_cpu_nice);
-        
-        if (unlikely(time_elapsed == 0)) {
+
+        if (unlikely(time_elapsed == 0))
             cur_load = 100;
-        } else {
+        else {
             unsigned int busy_time = time_elapsed - idle_delta;
             if (ignore_nice)
                 busy_time -= nice_delta;
             cur_load = 100 * busy_time / time_elapsed;
         }
-        
+
         cdbs->prev_cpu_idle = cur_idle;
         cdbs->prev_cpu_nice = cur_nice;
         cdbs->prev_update_time = cur_time;
-        
+
+        if (cpumask_test_cpu(cpu, &lp->perf_mask))
+            perf_load_sum += cur_load;
+        else if (cpumask_test_cpu(cpu, &lp->eff_mask))
+            e_load_sum += cur_load;
+        else if (cpumask_test_cpu(cpu, &lp->lp_eff_mask))
+            lp_e_load_sum += cur_load;
+
         load_sum += cur_load;
     }
 
-    if (unlikely(num_online_cpus() == 0))
-        return 0;
+    /* Weighted load based on power source and battery */
+    unsigned int final_load = 0;
+    if (perf_cpus || e_cpus || lp_e_cpus) {
+        unsigned int perf_load = perf_cpus ? perf_load_sum / perf_cpus : 0;
+        unsigned int e_load = e_cpus ? e_load_sum / e_cpus : 0;
+        unsigned int lp_e_load = lp_e_cpus ? lp_e_load_sum / lp_e_cpus : 0;
 
-    return load_sum / num_online_cpus();
+        if (!lap_is_on_ac(&battery_capacity) && battery_capacity <= 20)
+            final_load = (lp_e_load * 7 + e_load * 2 + perf_load * 1) / 10;
+        else if (!lap_is_on_ac(&battery_capacity))
+            final_load = (lp_e_load * 5 + e_load * 3 + perf_load * 2) / 10;
+        else
+            final_load = (perf_load * 5 + e_load * 3 + lp_e_load * 2) / 10;
+
+        return final_load;
+    }
+
+    return load_sum / cpumask_weight(policy->cpus);
 }
 
 /* lap_is_on_ac - Retrieves AC status and updates governor state */
-static void lap_is_on_ac(void)
+static bool lap_is_on_ac(int *battery_capacity)
 {
     struct power_supply *psy;
     union power_supply_propval val;
     int i;
-    
-    lap_on_ac_power = false;
+    bool on_ac = false;
+
+    *battery_capacity = 100;
 
     for (i = 0; i < ARRAY_SIZE(ac_names) && ac_names[i] != NULL; i++) {
         psy = power_supply_get_by_name(ac_names[i]);
@@ -249,138 +342,137 @@ static void lap_is_on_ac(void)
             continue;
         
         if (power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val) == 0 && val.intval) {
-            lap_on_ac_power = true;
+            on_ac = true;
         }
         power_supply_put(psy);
 
-        if (lap_on_ac_power) {
-            return;
+        if (on_ac) {
+            break;
         }
     }
+
+    psy = power_supply_get_by_name("battery");
+    if (psy) {
+        if (power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &val) == 0) {
+            *battery_capacity = val.intval;
+        }
+        power_supply_put(psy);
+    }
+
+    lap_on_ac_power = on_ac;
+    return on_ac;
 }
 
-
-static s16 lap_cnn_scale_load(unsigned int load, unsigned int target)
+static s16 lap_lstm_scale_load(unsigned int load, unsigned int target)
 {
     s64 diff = (s64)load - target;
-    s64 scaled = diff * CNN_ONE;
+    s64 scaled = diff * LSTM_ONE;
 
     scaled = div_s64(scaled, 100);
-    scaled = clamp_t(s64, scaled, CNN_MIN_VALUE, CNN_MAX_VALUE);
+    scaled = clamp_t(s64, scaled, LSTM_MIN_VALUE, LSTM_MAX_VALUE);
 
     return (s16)scaled;
 }
 
-static void lap_cnn_init(struct lap_cnn_state *state, s16 initial_sample)
+static void lap_lstm_init(struct lap_lstm_state *state, s16 initial_sample)
 {
     int i;
 
-    for (i = 0; i < CNN_WINDOW; i++)
+    for (i = 0; i < LSTM_WINDOW; i++)
         state->history[i] = initial_sample;
+    for (i = 0; i < LSTM_HIDDEN_SIZE; i++) {
+        state->hidden[i] = 0;
+        state->cell[i] = 0;
+    }
 }
 
-static void lap_cnn_push(struct lap_cnn_state *state, s16 sample)
+static void lap_lstm_push(struct lap_lstm_state *state, s16 sample)
 {
     memmove(&state->history[0], &state->history[1],
-        (CNN_WINDOW - 1) * sizeof(state->history[0]));
-    state->history[CNN_WINDOW - 1] = sample;
+        (LSTM_WINDOW - 1) * sizeof(state->history[0]));
+    state->history[LSTM_WINDOW - 1] = sample;
 }
 
-static s16 lap_cnn_predict(const struct lap_cnn_state *state)
+static s16 lap_lstm_predict(struct lap_lstm_state *state)
 {
-    s16 conv1_out[CNN_CONV1_OUT][CNN_WINDOW];
-    s16 conv2_out[CNN_WINDOW];
+    s32 i, j;
     s32 acc;
-    int pos, k, oc, ic;
-    int pad = CNN_KERNEL_SIZE / 2;
+    s16 input_gate[LSTM_HIDDEN_SIZE];
+    s16 forget_gate[LSTM_HIDDEN_SIZE];
+    s16 cell_gate[LSTM_HIDDEN_SIZE];
+    s16 output_gate[LSTM_HIDDEN_SIZE];
     s16 sample;
-    s64 sum = 0;
-    s64 avg64;
-    s32 avg32;
-    s32 fc_acc;
+    s32 fc_acc = 0;
 
-    for (oc = 0; oc < CNN_CONV1_OUT; oc++) {
-        for (pos = 0; pos < CNN_WINDOW; pos++) {
-            acc = (s32)lap_cnn_conv1_bias[oc] << CNN_Q;
-            for (k = 0; k < CNN_KERNEL_SIZE; k++) {
-                int idx = pos + k - pad;
+    for (i = 0; i < LSTM_WINDOW; i++) {
+        sample = state->history[i];
 
-                if (idx < 0)
-                    sample = state->history[0];
-                else if (idx >= CNN_WINDOW)
-                    sample = state->history[CNN_WINDOW - 1];
-                else
-                    sample = state->history[idx];
+        for (j = 0; j < LSTM_HIDDEN_SIZE; j++) {
+            // Input gate
+            acc = (s32)lap_lstm_b_i[j] << LSTM_Q;
+            acc += (s32)sample * lap_lstm_wg_i[j];
+            acc += (s32)state->hidden[j] * lap_lstm_wh_i[j][j];
+            input_gate[j] = lap_lstm_activate_sigmoid(acc >> LSTM_Q);
 
-                acc += (s32)lap_cnn_conv1_weights[oc][k] * sample;
-            }
+            // Forget gate
+            acc = (s32)lap_lstm_b_f[j] << LSTM_Q;
+            acc += (s32)sample * lap_lstm_wg_f[j];
+            acc += (s32)state->hidden[j] * lap_lstm_wh_f[j][j];
+            forget_gate[j] = lap_lstm_activate_sigmoid(acc >> LSTM_Q);
 
-            conv1_out[oc][pos] = lap_cnn_activate(acc >> CNN_Q);
+            // Cell gate
+            acc = (s32)lap_lstm_b_c[j] << LSTM_Q;
+            acc += (s32)sample * lap_lstm_wg_c[j];
+            acc += (s32)state->hidden[j] * lap_lstm_wh_c[j][j];
+            cell_gate[j] = lap_lstm_activate_tanh(acc >> LSTM_Q);
+
+            // Update cell state
+            state->cell[j] = ((s32)forget_gate[j] * state->cell[j] +
+                            (s32)input_gate[j] * cell_gate[j]) >> LSTM_Q;
+
+            // Output gate
+            acc = (s32)lap_lstm_b_o[j] << LSTM_Q;
+            acc += (s32)sample * lap_lstm_wg_o[j];
+            acc += (s32)state->hidden[j] * lap_lstm_wh_o[j][j];
+            output_gate[j] = lap_lstm_activate_sigmoid(acc >> LSTM_Q);
+
+            // Update hidden state
+            state->hidden[j] = ((s32)output_gate[j] *
+                              lap_lstm_activate_tanh((s32)state->cell[j] << LSTM_Q)) >> LSTM_Q;
         }
     }
 
-    for (pos = 0; pos < CNN_WINDOW; pos++) {
-        acc = (s32)lap_cnn_conv2_bias[0] << CNN_Q;
-        for (ic = 0; ic < CNN_CONV1_OUT; ic++) {
-            for (k = 0; k < CNN_KERNEL_SIZE; k++) {
-                int idx = pos + k - pad;
-
-                if (idx < 0)
-                    sample = conv1_out[ic][0];
-                else if (idx >= CNN_WINDOW)
-                    sample = conv1_out[ic][CNN_WINDOW - 1];
-                else
-                    sample = conv1_out[ic][idx];
-
-                acc += (s32)lap_cnn_conv2_weights[0][ic][k] * sample;
-            }
-        }
-
-        conv2_out[pos] = lap_cnn_clamp(acc >> CNN_Q);
-        sum += conv2_out[pos];
+    for (i = 0; i < LSTM_HIDDEN_SIZE; i++) {
+        fc_acc += (s32)state->hidden[i] * lap_lstm_fc_weight[i];
     }
+    fc_acc = (fc_acc >> LSTM_Q) + lap_lstm_fc_bias;
 
-    avg64 = div_s64(sum, CNN_WINDOW);
-    avg64 = clamp_t(s64, avg64, CNN_MIN_VALUE, CNN_MAX_VALUE);
-    avg32 = (s32)avg64;
-
-    fc_acc = ((s32)lap_cnn_fc_bias << CNN_Q) + (s32)lap_cnn_fc_weight * avg32;
-    return lap_cnn_clamp(fc_acc >> CNN_Q);
+    return lap_lstm_clamp(fc_acc);
 }
 
-static void lap_apply_cnn_policy(struct cpufreq_policy *policy,
+static void lap_apply_lstm_policy(struct cpufreq_policy *policy,
                  struct lap_policy_info *lp, unsigned int load)
 {
     unsigned int requested_freq = lp->requested_freq;
     unsigned int step_khz = lap_get_freq_step_khz(&lp->tuners, policy);
-    s16 cnn_sample;
-    s16 cnn_output;
+    s16 lstm_sample;
+    s16 lstm_output;
     s64 scaled_delta;
     s64 delta_khz;
 
-    cnn_sample = lap_cnn_scale_load(load, lp->tuners.target_load);
-    lap_cnn_push(&lp->cnn, cnn_sample);
+    lstm_sample = lap_lstm_scale_load(load, lp->tuners.target_load);
+    lap_lstm_push(&lp->lstm, lstm_sample);
 
     if (load >= LAP_HIGH_LOAD_BYPASS) {
         requested_freq = policy->max;
     } else if (load <= LAP_LOW_LOAD_BYPASS) {
         requested_freq = policy->min;
     } else {
-        cnn_output = lap_cnn_predict(&lp->cnn);
-        /*
-         * Avoid overly aggressive corrections when the CNN saturates by
-         * bounding its output to the nominal [-1.0, 1.0] range.
-         */
-        cnn_output = clamp_t(s16, cnn_output, -CNN_ONE, CNN_ONE);
+        lstm_output = lap_lstm_predict(&lp->lstm);
+        lstm_output = clamp_t(s16, lstm_output, -LSTM_ONE, LSTM_ONE);
 
-        scaled_delta = (s64)cnn_output * lp->tuners.learning_rate_fp;
-        delta_khz = (scaled_delta * step_khz) >> (CNN_Q + FP_SHIFT);
-        /*
-         * Apply an additional rate limit so that a single update cannot jump
-         * more than one frequency step in either direction. This prevents the
-         * governor from bouncing between policy extremes when the predictor is
-         * momentarily unstable.
-         */
+        scaled_delta = (s64)lstm_output * lp->tuners.learning_rate_fp;
+        delta_khz = (scaled_delta * step_khz) >> (LSTM_Q + FP_SHIFT);
         delta_khz = clamp_t(s64, delta_khz, -(s64)step_khz, (s64)step_khz);
 
         requested_freq = clamp_val((s64)requested_freq + delta_khz,
@@ -406,8 +498,10 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
     tuners = &lp->tuners;
     mutex_lock(&lp->lock);
 
-    if (policy->cpu == 0)
-        lap_is_on_ac();
+    if (policy->cpu == 0) {
+        int battery_capacity;
+        lap_on_ac_power = lap_is_on_ac(&battery_capacity);
+    }
 
     if (lap_on_ac_power) {
         tuners->learning_rate_fp = LAP_AC_LEARNING_RATE_FP;
@@ -420,18 +514,18 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
     }
 
     mutex_lock(&lap_global_lock);
-    lap_global_load = lap_dbs_get_load(tuners->ignore_nice_load);
+    lap_global_load = lap_dbs_get_load(policy, tuners->ignore_nice_load);
     mutex_unlock(&lap_global_lock);
 
     load = lap_global_load;
 
     if (lp->last_target_load != tuners->target_load) {
-        s16 reset_sample = lap_cnn_scale_load(load, tuners->target_load);
-        lap_cnn_init(&lp->cnn, reset_sample);
+        s16 reset_sample = lap_lstm_scale_load(load, tuners->target_load);
+        lap_lstm_init(&lp->lstm, reset_sample);
         lp->last_target_load = tuners->target_load;
     }
 
-    lap_apply_cnn_policy(policy, lp, load);
+    lap_apply_lstm_policy(policy, lp, load);
 
     mutex_unlock(&lp->lock);
     return (unsigned long)tuners->sampling_rate * HZ;
@@ -491,7 +585,7 @@ static ssize_t store_target_load(struct kobject *kobj, struct kobj_attribute *at
         current_load = lap_global_load;
         mutex_unlock(&lap_global_lock);
 
-        lap_cnn_init(&lp->cnn, lap_cnn_scale_load(current_load, val));
+        lap_lstm_init(&lp->lstm, lap_lstm_scale_load(current_load, val));
     }
     mutex_unlock(&lp->lock);
     return count;
@@ -729,7 +823,7 @@ static int lap_start(struct cpufreq_policy *policy)
     lp->tuners.learning_rate_fp = LAP_DEF_LEARNING_RATE_FP;
     lp->tuners.target_load = LAP_DEF_TARGET_LOAD;
     lp->last_target_load = lp->tuners.target_load;
-    lap_cnn_init(&lp->cnn, 0);
+    lap_lstm_init(&lp->lstm, 0);
     if (policy->cur)
         lp->requested_freq = policy->cur;
     else
@@ -793,13 +887,23 @@ static int __init baram_module_init(void)
 }
 
 static void __exit baram_module_exit(void)
+
 {
+
     cpufreq_unregister_governor(&baram_governor);
+
 }
 
+
+
 MODULE_AUTHOR("Lee Yunjin <gzblues61@daum.net>");
-MODULE_DESCRIPTION("'cpufreq_baram' - Conservative-style governor for laptops with lightweight 1D CNN inference");
+
+MODULE_DESCRIPTION("'cpufreq_baram' - Conservative-style governor for laptops with lightweight LSTM inference");
+
 MODULE_LICENSE("GPL");
 
+
+
 module_init(baram_module_init);
+
 module_exit(baram_module_exit);
