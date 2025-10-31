@@ -1,7 +1,7 @@
 # Baram: An Intelligent, Power-Aware CPU Governor for Laptops
 
 **Baram**is a custom CPU frequency governor built for laptops, designed to balance **performance and battery life** more intelligently than traditional load-based governors.
-Instead of reacting only to raw CPU utilization, Baram runs a **lightweight 1D convolutional neural network (CNN)** entirely inside the kernel. The network ingests a short history of normalized load samples and outputs a signed adjustment that nudges the requested frequency toward what the model predicts the workload will need.
+Instead of reacting only to raw CPU utilization, Baram runs a **lightweight 1D convolutional neural network (CNN) and a Long Short-Term Memory (LSTM) network** entirely inside the kernel. The CNN ingests a short history of normalized load samples and outputs a signed adjustment that nudges the requested frequency toward what the model predicts the workload will need. The LSTM network is used for real-time training to adapt to changing workload patterns.
 
 ### This is rt-train(Real-time Train) branch
 
@@ -12,13 +12,16 @@ Instead of reacting only to raw CPU utilization, Baram runs a **lightweight 1D c
 ### 1. Lightweight 1D CNN Forecaster
 Baram keeps a fixed-length (16 sample) history buffer of CPU load that is normalized around the configurable `target_load`. Each update runs two tiny convolutional layers (kernel width 3, leaky-ReLU activations) followed by global averaging and a fully connected output. The entire pipeline is implemented with fixed-point math so it remains safe for kernel space yet still captures short-term workload trends.
 
-### 2. History Normalization & Target Tracking
+### 2. Real-time LSTM-based Training
+The rt-train branch incorporates a simple LSTM network for real-time training within the kernel. This allows the governor to adapt its predictions based on recent CPU load patterns. The LSTM model has a hidden size of 4 and takes a single input. The training process adjusts the weights of the fully connected layer based on the error between the predicted and actual CPU load, allowing the governor to continuously learn and improve its performance.
+
+### 3. History Normalization & Target Tracking
 Every sample stored in the CNN buffer represents the deviation from the current `target_load`. When the target changes—either because the system switches power source or the user writes a new value—the history is re-initialised so that the network immediately adapts to the new operating point.
 
-### 3. Hybrid Safety Overrides
+### 4. Hybrid Safety Overrides
 The CNN drives the incremental adjustments, but Baram still applies deterministic guard rails. Extremely high load snapshots push the policy straight to the maximum frequency, while near-idle snapshots collapse to the minimum. This prevents the neural network from ever starving the CPU when responsiveness is critical.
 
-### 4. Battery-Aware Gain Scheduling
+### 5. Battery-Aware Gain Scheduling
 The same network runs on both AC and battery, but its output is scaled differently. On AC power Baram increases both the frequency step size and the neural output gain for snappy response. On battery the gain is reduced and the frequency steps shrink, trading peak performance for sustained efficiency without retraining the model.
 
 ---

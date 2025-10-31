@@ -38,6 +38,9 @@
 #define CNN_CONV1_OUT 2
 #define CNN_CONV2_OUT 1
 
+#define LSTM_HIDDEN_SIZE 4
+#define LSTM_INPUT_SIZE 1
+
 #define CNN_MAX_VALUE  32767
 #define CNN_MIN_VALUE -32768
 
@@ -72,6 +75,32 @@ DEFINE_PER_CPU(struct lap_cpu_dbs, lap_cpu_dbs);
 static DEFINE_MUTEX(lap_global_lock);
 static unsigned int lap_global_load;
 static bool lap_on_ac_power;
+static battery_t lap_battery_status;
+
+static void lap_get_battery_status(void)
+{
+    struct power_supply *psy;
+    union power_supply_propval val;
+    int i;
+
+    lap_battery_status.active = false;
+
+    for (i = 0; i < ARRAY_SIZE(battery_names) && battery_names[i] != NULL; i++) {
+        psy = power_supply_get_by_name(battery_names[i]);
+        if (!psy)
+            continue;
+
+        if (power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &val) == 0) {
+            lap_battery_status.remaining = val.intval;
+            lap_battery_status.active = true;
+        }
+        power_supply_put(psy);
+
+        if (lap_battery_status.active) {
+            return;
+        }
+    }
+}
 
 static DEFINE_MUTEX(lap_cnn_weight_lock);
 
@@ -84,15 +113,19 @@ struct lap_tuners {
     unsigned int target_load;
 };
 
-struct lap_cnn_state {
+
+
+struct lap_lstm_state {
     s16 history[CNN_WINDOW];
+    s16 hidden[LSTM_HIDDEN_SIZE];
+    s16 cell[LSTM_HIDDEN_SIZE];
 };
 
 struct lap_policy_info {
     struct cpufreq_policy *policy;
     unsigned int requested_freq;
     struct lap_tuners tuners;
-    struct lap_cnn_state cnn;
+    struct lap_lstm_state cnn;
     unsigned int last_target_load;
     struct delayed_work work;
     struct mutex lock;
@@ -103,28 +136,41 @@ struct lap_policy_info {
     s16 cnn_smoothed_output;
 };
 
-#if CNN_CONV2_OUT != 1
-#error "Current implementation expects a single output channel"
-#endif
 
-static s16 lap_cnn_conv1_weights[CNN_CONV1_OUT][CNN_KERNEL_SIZE] = {
-    { -256, 0, 256 },
-    { 128, 256, 128 },
-};
 
-static s16 lap_cnn_conv1_bias[CNN_CONV1_OUT] = { 0, 0 };
+static s16 lstm_w_ih[LSTM_HIDDEN_SIZE * 4][LSTM_INPUT_SIZE];
+static s16 lstm_w_hh[LSTM_HIDDEN_SIZE * 4][LSTM_HIDDEN_SIZE];
+static s16 lstm_b_ih[LSTM_HIDDEN_SIZE * 4];
+static s16 lstm_b_hh[LSTM_HIDDEN_SIZE * 4];
 
-static s16 lap_cnn_conv2_weights[CNN_CONV2_OUT][CNN_CONV1_OUT][CNN_KERNEL_SIZE] = {
-    {
-        { -192, 0, 192 },
-        { 64, 128, 64 },
-    },
-};
+static s16 lstm_fc_weight[LSTM_HIDDEN_SIZE];
+static s16 lstm_fc_bias = 0;
 
-static s16 lap_cnn_conv2_bias[CNN_CONV2_OUT] = { 0 };
 
-static s16 lap_cnn_fc_weight = 768; /* ~0.75 in Q10 */
-static s16 lap_cnn_fc_bias = 0;
+static void initialize_lstm_weights(void)
+{
+    int i, j;
+
+    for (i = 0; i < LSTM_HIDDEN_SIZE * 4; i++) {
+        for (j = 0; j < LSTM_INPUT_SIZE; j++) {
+            lstm_w_ih[i][j] = (i % 3 - 1) * 128;
+        }
+        lstm_b_ih[i] = 0;
+        lstm_b_hh[i] = 0;
+    }
+
+    for (i = 0; i < LSTM_HIDDEN_SIZE * 4; i++) {
+        for (j = 0; j < LSTM_HIDDEN_SIZE; j++) {
+            lstm_w_hh[i][j] = (i % 2) * 128;
+        }
+    }
+
+    for (i = 0; i < LSTM_HIDDEN_SIZE; i++) {
+        lstm_fc_weight[i] = 256;
+    }
+    lstm_fc_bias = 0;
+}
+
 
 #define LAP_DEF_FREQ_STEP          5
 #define LAP_MAX_FREQ_STEP_PERCENT  25
@@ -137,11 +183,7 @@ static s16 lap_cnn_fc_bias = 0;
 static inline unsigned int lap_get_freq_step_khz(struct lap_tuners *tuners, struct cpufreq_policy *policy);
 static unsigned int lap_dbs_get_load(bool ignore_nice);
 static s16 lap_cnn_scale_load(unsigned int load, unsigned int target);
-static void lap_cnn_init(struct lap_cnn_state *state, s16 initial_sample);
-static void lap_cnn_reset_state(struct lap_policy_info *lp, s16 initial_sample);
-static void lap_cnn_push(struct lap_cnn_state *state, s16 sample);
-static s16 lap_cnn_predict(const struct lap_cnn_state *state, s32 *avg_out);
-static void lap_cnn_train(struct lap_policy_info *lp, s16 actual_sample);
+
 static void lap_apply_cnn_policy(struct cpufreq_policy *policy, struct lap_policy_info *lp, unsigned int load, s16 cnn_sample);
 static unsigned long cs_dbs_update(struct cpufreq_policy *policy);
 static void lap_work_handler(struct work_struct *work);
@@ -281,17 +323,21 @@ static s16 lap_cnn_scale_load(unsigned int load, unsigned int target)
     return (s16)scaled;
 }
 
-static void lap_cnn_init(struct lap_cnn_state *state, s16 initial_sample)
+static void lap_lstm_init(struct lap_lstm_state *state, s16 initial_sample)
 {
     int i;
 
     for (i = 0; i < CNN_WINDOW; i++)
         state->history[i] = initial_sample;
+    for (i = 0; i < LSTM_HIDDEN_SIZE; i++) {
+        state->hidden[i] = 0;
+        state->cell[i] = 0;
+    }
 }
 
-static void lap_cnn_reset_state(struct lap_policy_info *lp, s16 initial_sample)
+static void lap_lstm_reset_state(struct lap_policy_info *lp, s16 initial_sample)
 {
-    lap_cnn_init(&lp->cnn, initial_sample);
+    lap_lstm_init(&lp->cnn, initial_sample);
     lp->cnn_has_prediction = false;
     lp->cnn_last_prediction = initial_sample;
     lp->cnn_last_avg = 0;
@@ -299,85 +345,87 @@ static void lap_cnn_reset_state(struct lap_policy_info *lp, s16 initial_sample)
     lp->cnn_smoothed_output = initial_sample;
 }
 
-static void lap_cnn_push(struct lap_cnn_state *state, s16 sample)
+static void lap_lstm_push(struct lap_lstm_state *state, s16 sample)
 {
     memmove(&state->history[0], &state->history[1],
         (CNN_WINDOW - 1) * sizeof(state->history[0]));
     state->history[CNN_WINDOW - 1] = sample;
 }
 
-static s16 lap_cnn_predict(const struct lap_cnn_state *state, s32 *avg_out)
-{
-    s16 conv1_out[CNN_CONV1_OUT][CNN_WINDOW];
-    s16 conv2_out[CNN_WINDOW];
-    s32 acc;
-    int pos, k, oc, ic;
-    int pad = CNN_KERNEL_SIZE / 2;
-    s16 sample;
-    s64 sum = 0;
-    s64 avg64;
-    s32 avg32;
-    s32 fc_acc;
-
-    for (oc = 0; oc < CNN_CONV1_OUT; oc++) {
-        for (pos = 0; pos < CNN_WINDOW; pos++) {
-            acc = (s32)lap_cnn_conv1_bias[oc] << CNN_Q;
-            for (k = 0; k < CNN_KERNEL_SIZE; k++) {
-                int idx = pos + k - pad;
-
-                if (idx < 0)
-                    sample = state->history[0];
-                else if (idx >= CNN_WINDOW)
-                    sample = state->history[CNN_WINDOW - 1];
-                else
-                    sample = state->history[idx];
-
-                acc += (s32)lap_cnn_conv1_weights[oc][k] * sample;
-            }
-
-            conv1_out[oc][pos] = lap_cnn_activate(acc >> CNN_Q);
-        }
-    }
-
-    for (pos = 0; pos < CNN_WINDOW; pos++) {
-        acc = (s32)lap_cnn_conv2_bias[0] << CNN_Q;
-        for (ic = 0; ic < CNN_CONV1_OUT; ic++) {
-            for (k = 0; k < CNN_KERNEL_SIZE; k++) {
-                int idx = pos + k - pad;
-
-                if (idx < 0)
-                    sample = conv1_out[ic][0];
-                else if (idx >= CNN_WINDOW)
-                    sample = conv1_out[ic][CNN_WINDOW - 1];
-                else
-                    sample = conv1_out[ic][idx];
-
-                acc += (s32)lap_cnn_conv2_weights[0][ic][k] * sample;
-            }
-        }
-
-        conv2_out[pos] = lap_cnn_clamp(acc >> CNN_Q);
-        sum += conv2_out[pos];
-    }
-
-    avg64 = div_s64(sum, CNN_WINDOW);
-    avg64 = clamp_t(s64, avg64, CNN_MIN_VALUE, CNN_MAX_VALUE);
-    avg32 = (s32)avg64;
-
-    if (avg_out)
-        *avg_out = avg32;
-
-    fc_acc = ((s32)lap_cnn_fc_bias << CNN_Q) + (s32)lap_cnn_fc_weight * avg32;
-    return lap_cnn_clamp(fc_acc >> CNN_Q);
+static s16 sigmoid_approx(s32 x) {
+    x = clamp_t(s32, x, -8 * CNN_ONE, 8 * CNN_ONE);
+    s64 x2 = (s64)x * x >> CNN_Q;
+    s64 x3 = (s64)x2 * x >> CNN_Q;
+    s32 res = (x >> 1) - (x3 >> 4) + (x3 * x2 >> (2 * CNN_Q + 6));
+    return lap_cnn_clamp(res + (CNN_ONE >> 1));
 }
 
-static void lap_cnn_train(struct lap_policy_info *lp, s16 actual_sample)
-{
+static s16 tanh_approx(s32 x) {
+    x = clamp_t(s32, x, -4 * CNN_ONE, 4 * CNN_ONE);
+    s64 x2 = (s64)x * x >> CNN_Q;
+    s64 x3 = (s64)x2 * x >> CNN_Q;
+    s32 res = x - (x3 >> 2) + (x3 * x2 >> (2 * CNN_Q + 4));
+    return lap_cnn_clamp(res);
+}
+
+static void lap_lstm_step(s16 x, s16* h, s16* C, s32* avg_out) {
+    s32 i_gate, f_gate, g_gate, o_gate;
+    s32 hidden_acc, cell_acc;
+    int i, j;
+
+    hidden_acc = 0;
+    cell_acc = 0;
+
+    for (i = 0; i < LSTM_HIDDEN_SIZE; i++) {
+        i_gate = (s32)lstm_w_ih[i][0] * x + lstm_b_ih[i];
+        f_gate = (s32)lstm_w_ih[i + LSTM_HIDDEN_SIZE][0] * x + lstm_b_ih[i + LSTM_HIDDEN_SIZE];
+        g_gate = (s32)lstm_w_ih[i + 2 * LSTM_HIDDEN_SIZE][0] * x + lstm_b_ih[i + 2 * LSTM_HIDDEN_SIZE];
+        o_gate = (s32)lstm_w_ih[i + 3 * LSTM_HIDDEN_SIZE][0] * x + lstm_b_ih[i + 3 * LSTM_HIDDEN_SIZE];
+
+        for (j = 0; j < LSTM_HIDDEN_SIZE; j++) {
+            i_gate += (s32)lstm_w_hh[i][j] * h[j];
+            f_gate += (s32)lstm_w_hh[i + LSTM_HIDDEN_SIZE][j] * h[j];
+            g_gate += (s32)lstm_w_hh[i + 2 * LSTM_HIDDEN_SIZE][j] * h[j];
+            o_gate += (s32)lstm_w_hh[i + 3 * LSTM_HIDDEN_SIZE][j] * h[j];
+        }
+
+        i_gate = sigmoid_approx(i_gate >> (CNN_Q - 4));
+        f_gate = sigmoid_approx(f_gate >> (CNN_Q - 4));
+        g_gate = tanh_approx(g_gate >> (CNN_Q - 4));
+        o_gate = sigmoid_approx(o_gate >> (CNN_Q - 4));
+
+        C[i] = ((s64)f_gate * C[i] >> CNN_Q) + ((s64)i_gate * g_gate >> CNN_Q);
+        h[i] = ((s64)o_gate * tanh_approx((s32)C[i] << 4) >> CNN_Q);
+
+        hidden_acc += h[i];
+        cell_acc += C[i];
+    }
+
+    if (avg_out)
+        *avg_out = hidden_acc / LSTM_HIDDEN_SIZE;
+}
+
+static s16 lap_lstm_predict(struct lap_lstm_state *state, s32 *avg_out) {
+    int i;
+    s32 fc_acc = 0;
+
+    for (i = 0; i < CNN_WINDOW; i++) {
+        lap_lstm_step(state->history[i], state->hidden, state->cell, avg_out);
+    }
+
+    for (i = 0; i < LSTM_HIDDEN_SIZE; i++) {
+        fc_acc += (s32)lstm_fc_weight[i] * state->hidden[i];
+    }
+
+    fc_acc = (fc_acc >> CNN_Q) + lstm_fc_bias;
+    return lap_cnn_clamp(fc_acc);
+}
+
+static void lap_lstm_train(struct lap_policy_info *lp, s16 actual_sample) {
     s32 error;
     s32 delta_w;
     s32 delta_b;
-    s32 new_weight;
-    s32 new_bias;
+    int i;
 
     if (!lp->cnn_has_prediction)
         return;
@@ -388,14 +436,13 @@ static void lap_cnn_train(struct lap_policy_info *lp, s16 actual_sample)
 
     mutex_lock(&lap_cnn_weight_lock);
 
-    delta_w = (s32)(((s64)error * lp->cnn_last_avg) >> (CNN_Q + LAP_TRAIN_RATE_SHIFT));
+    for (i = 0; i < LSTM_HIDDEN_SIZE; i++) {
+        delta_w = (s32)(((s64)error * lp->cnn.hidden[i]) >> (CNN_Q + LAP_TRAIN_RATE_SHIFT));
+        lstm_fc_weight[i] = (s16)clamp_t(s32, (s32)lstm_fc_weight[i] + delta_w, CNN_MIN_VALUE, CNN_MAX_VALUE);
+    }
+
     delta_b = (s32)(((s64)error) >> LAP_TRAIN_BIAS_SHIFT);
-
-    new_weight = (s32)lap_cnn_fc_weight + delta_w;
-    new_bias = (s32)lap_cnn_fc_bias + delta_b;
-
-    lap_cnn_fc_weight = (s16)clamp_t(s32, new_weight, CNN_MIN_VALUE, CNN_MAX_VALUE);
-    lap_cnn_fc_bias = (s16)clamp_t(s32, new_bias, CNN_MIN_VALUE, CNN_MAX_VALUE);
+    lstm_fc_bias = (s16)clamp_t(s32, (s32)lstm_fc_bias + delta_b, CNN_MIN_VALUE, CNN_MAX_VALUE);
 
     mutex_unlock(&lap_cnn_weight_lock);
 
@@ -414,7 +461,7 @@ static void lap_apply_cnn_policy(struct cpufreq_policy *policy,
     s64 delta_khz;
     s32 applied_output;
 
-    lap_cnn_push(&lp->cnn, cnn_sample);
+    lap_lstm_push(&lp->cnn, cnn_sample);
 
     if (load >= LAP_HIGH_LOAD_BYPASS) {
         requested_freq = policy->max;
@@ -425,7 +472,7 @@ static void lap_apply_cnn_policy(struct cpufreq_policy *policy,
         lp->cnn_has_prediction = false;
         lp->cnn_has_history = false;
     } else {
-        cnn_output = lap_cnn_predict(&lp->cnn, &avg32);
+        cnn_output = lap_lstm_predict(&lp->cnn, &avg32);
 
         applied_output = cnn_output;
         if (lp->cnn_has_history) {
@@ -468,15 +515,21 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
     tuners = &lp->tuners;
     mutex_lock(&lp->lock);
 
-    if (policy->cpu == 0)
+    if (policy->cpu == 0) {
         lap_is_on_ac();
+        lap_get_battery_status();
+    }
 
     if (lap_on_ac_power) {
         tuners->learning_rate_fp = LAP_AC_LEARNING_RATE_FP;
         tuners->freq_step = LAP_AC_FREQ_STEP;
         tuners->target_load = LAP_AC_TARGET_LOAD;
     } else {
-        tuners->learning_rate_fp = LAP_BATTERY_LEARNING_RATE_FP;
+        if (lap_battery_status.active && lap_battery_status.remaining >= 50) {
+            tuners->learning_rate_fp = LAP_BATTERY_LEARNING_RATE_FP;
+        } else {
+            tuners->learning_rate_fp = LAP_BATTERY_LEARNING_RATE_FP / 2;
+        }
         tuners->freq_step = LAP_BATTERY_FREQ_STEP;
         tuners->target_load = LAP_BATTERY_TARGET_LOAD;
     }
@@ -489,13 +542,13 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
     cnn_sample = lap_cnn_scale_load(load, tuners->target_load);
 
     if (lp->last_target_load != tuners->target_load) {
-        lap_cnn_reset_state(lp, cnn_sample);
+        lap_lstm_reset_state(lp, cnn_sample);
         lp->last_target_load = tuners->target_load;
         target_changed = true;
     }
 
     if (!target_changed)
-        lap_cnn_train(lp, cnn_sample);
+        lap_lstm_train(lp, cnn_sample);
 
     lap_apply_cnn_policy(policy, lp, load, cnn_sample);
 
@@ -559,7 +612,7 @@ static ssize_t store_target_load(struct kobject *kobj, struct kobj_attribute *at
         mutex_unlock(&lap_global_lock);
 
         reset_sample = lap_cnn_scale_load(current_load, val);
-        lap_cnn_reset_state(lp, reset_sample);
+        lap_lstm_reset_state(lp, reset_sample);
     }
     mutex_unlock(&lp->lock);
     return count;
@@ -797,7 +850,8 @@ static int lap_start(struct cpufreq_policy *policy)
     lp->tuners.learning_rate_fp = LAP_DEF_LEARNING_RATE_FP;
     lp->tuners.target_load = LAP_DEF_TARGET_LOAD;
     lp->last_target_load = lp->tuners.target_load;
-    lap_cnn_reset_state(lp, 0);
+    initialize_lstm_weights();
+    lap_lstm_reset_state(lp, 0);
     if (policy->cur)
         lp->requested_freq = policy->cur;
     else
